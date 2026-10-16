@@ -623,6 +623,7 @@ type TestNode struct {
 	encryptState bool
 	allowUpdates bool
 	tunMode      bool // TUN rather than userspace networking
+	unattended   bool
 
 	mu        sync.Mutex
 	onLogLine []func([]byte)
@@ -654,6 +655,13 @@ func (o tunModeOpt) modifyTestNode(n *TestNode) { n.tunMode = bool(o) }
 // On Windows, TUN mode currently requires running as a service.
 func TUNMode(v bool) TestNodeOpt { return tunModeOpt(v) }
 
+type unattendedOpt bool
+
+func (o unattendedOpt) modifyTestNode(n *TestNode) { n.unattended = bool(o) }
+
+// Unattended sets whether a Windows node runs unattended or watches the IPN bus like the GUI.
+func Unattended(v bool) TestNodeOpt { return unattendedOpt(v) }
+
 // tunSlot is the node running in TUN mode, or nil, as a host has room for only one.
 var tunSlot syncs.AtomicValue[*TestNode]
 
@@ -684,9 +692,10 @@ func (n *TestNode) releaseTUNSlot() {
 func NewTestNode(t *testing.T, env *TestEnv, opts ...TestNodeOpt) *TestNode {
 	dir := t.TempDir()
 	n := &TestNode{
-		env:     env,
-		dir:     dir,
-		tunMode: defaultTUNMode(),
+		env:        env,
+		dir:        dir,
+		tunMode:    defaultTUNMode(),
+		unattended: true,
 	}
 	for _, o := range opts {
 		o.modifyTestNode(n)
@@ -988,7 +997,11 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 	if runtime.GOOS == "windows" && n.tunMode {
 		// TODO(#20443): plumb service logs here so races/panics/DEBUG-ADDR are seen in service mode.
 		n.tailscaledParser = &nodeOutputParser{n: n}
-		return n.startWindowsServiceDaemon()
+		d := n.startWindowsServiceDaemon()
+		if !n.unattended {
+			n.watchIPNBusLikeGUI()
+		}
+		return d
 	}
 
 	cmd := exec.Command(n.env.daemon)
@@ -1056,10 +1069,32 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 		cmd.Process.Kill()
 		cmd.Process.Wait()
 	})
+	if runtime.GOOS == "windows" && !n.unattended {
+		n.watchIPNBusLikeGUI()
+	}
 	return &Daemon{
 		Process: cmd.Process,
 		node:    n,
 	}
+}
+
+// watchIPNBusLikeGUI reads the IPN bus for the rest of the test, as the GUI does.
+func (n *TestNode) watchIPNBusLikeGUI() {
+	t := n.env.t
+	t.Helper()
+	n.AwaitListening()
+	w, err := n.LocalClient().WatchIPNBus(t.Context(), 0)
+	if err != nil {
+		t.Fatalf("watching IPN bus: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+	go func() {
+		for {
+			if _, err := w.Next(); err != nil {
+				return
+			}
+		}
+	}()
 }
 
 func (n *TestNode) MustUp(extraArgs ...string) {
@@ -1234,7 +1269,7 @@ func (n *TestNode) TailscaleForOutput(arg ...string) *exec.Cmd {
 // It does not start the process.
 func (n *TestNode) Tailscale(arg ...string) *exec.Cmd {
 	isUp := len(arg) > 0 && arg[0] == "up"
-	if isUp && cmp.Or(n.upFlagGOOS, runtime.GOOS) == "windows" {
+	if isUp && n.unattended && cmp.Or(n.upFlagGOOS, runtime.GOOS) == "windows" {
 		isBareUp := len(arg) == 1
 		// --unattended keeps the current profile after the CLI exits; without it
 		// Windows switches to an empty background profile and the node drops to NoState.
