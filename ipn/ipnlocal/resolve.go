@@ -70,7 +70,7 @@ func (b *LocalBackend) resolveMagicDNS(hostname, network string) (_ netip.Addr, 
 		}
 		return netip.Addr{}, false
 	}
-	if ip, ok := nb.ExtraDNSByName(hostname); ok && addrFamilyMatch(ip, network) {
+	if ip, ok := nb.ExtraDNSByName(hostname, network); ok {
 		return ip, true
 	}
 	return netip.Addr{}, false
