@@ -338,6 +338,7 @@ type Server struct {
 	proxyCred           string        // SOCKS5 proxy auth for loopbackListener
 	localAPICred        string        // basic auth password for loopbackListener
 	loopbackListener    net.Listener  // optional loopback for localapi and proxies
+	loopbackMu          sync.Mutex    // guards loopbackListener and its creds in Loopback
 	localAPIListener    net.Listener  // in-memory, used by localClient
 	localClient         *local.Client // in-memory
 	localAPIServer      *http.Server
@@ -476,6 +477,18 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		return "", "", "", err
 	}
 
+	s.loopbackMu.Lock()
+	defer s.loopbackMu.Unlock()
+
+	// The OS can reclaim the listener out from under us (iOS does it to a
+	// suspended app's listening sockets), leaving a cached address nothing
+	// answers on. Start a new one instead of handing that out again.
+	if s.loopbackListener != nil && !loopbackAnswers(s.loopbackListener.Addr()) {
+		s.logf("tsnet: loopback listener no longer accepts connections; starting a new one")
+		s.loopbackListener.Close()
+		s.loopbackListener = nil
+	}
+
 	if s.loopbackListener == nil {
 		var proxyCred [16]byte
 		if _, err := crand.Read(proxyCred[:]); err != nil {
@@ -535,6 +548,20 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		panic("loopbackListener has no Addr")
 	}
 	return lbAddr.String(), s.proxyCred, s.localAPICred, nil
+}
+
+// loopbackAnswers reports whether something still accepts TCP connections
+// on addr.
+func loopbackAnswers(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	c, err := net.DialTimeout("tcp", addr.String(), time.Second)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
 }
 
 type localSecHandler struct {
@@ -689,9 +716,11 @@ func (s *Server) close() {
 	if s.localAPIListener != nil {
 		s.localAPIListener.Close()
 	}
+	s.loopbackMu.Lock()
 	if s.loopbackListener != nil {
 		s.loopbackListener.Close()
 	}
+	s.loopbackMu.Unlock()
 
 	wg.Wait()
 	// s.sys is only assigned partway through doInit, so it is still nil if
